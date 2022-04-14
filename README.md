@@ -1,0 +1,11 @@
+# Predicting PS4 games’ review score
+
+This repository contains the work I did for a project combining web scraping and text analysis. The goal was to collect PS4 game reviews from the [IGN.com] website (https://www.ign.com/news), and then perform text analysis to help building a model predicting the score attributed to the games reviewed.
+
+As a first step, I applied web scraping techniques to create a dataset of PS4 game reviews. I collected a list of URLs from hundreds of PS4 game reviews. I then used these URLs to scan each review's page and collect the text of the review as well as additional information. In the second step, I applied data exploration and sentiment analysis techniques to determine what differentiates reviews of good and less good PS4 games. Finally, I built a regression model to predict the score awarded by the review using information such as the content of the review and its length.
+
+If you're interested in this project, you can see a full description in a [post](https://gorinsimon.github.io/posts/2022/04/ps4-review-prediction) on my website.
+
+Regarding the structure of the repository, the `function` folder contains the scripts and functions used to scrap IGN website and create the dataset. The URL of each PS4 game's review was collected using the code in `get_ps4_urls_script.R`. Then, each review's page has been scraped using the the code `get_reviews_script.R`. This function is basically a call to the function `get_review.R` that collects the content of a single page. The folder data contains two files: `ps4_games_url.csv` (a list with the url of all reviews collected) and `ps4_reviews.csv` (the dataset created for this project). Finally, the file `analysis.Rmd`contains all the steps of the project (EDA and modeling), as described in the [post](https://gorinsimon.github.io/posts/2022/04/ps4-review-prediction) on my website.
+
+Do no hesitate to contact me if you can't find the information you are looking for or if you just want to chat about this project.

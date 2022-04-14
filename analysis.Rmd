@@ -1,0 +1,631 @@
+---
+title: "Predicting PS4 games' review score"
+author: "Simon Gorin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    highlight: haddock
+    mathjax: null
+    number_sections: false
+    css: ["styles.css"]
+    self_contained: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+
+knitr::opts_chunk$set(eval = TRUE, echo = TRUE, include = TRUE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 5, fig.retina = 3, fig.align = "center", out.width = "80%", comment = "#>", dev = 'svglite')
+
+here::i_am("analysis.Rmd")
+showtext::showtext_opts(dpi = 320)
+
+library(tidyverse)
+library(tidytext)
+library(gt)
+library(patchwork)
+library(here)
+
+```
+
+I like to play video games since I was a kid. I still remember the first console I owned and the first game I played. It was *Super Marios Bros.* on a *Super NES*. Since then, I've had several other consoles and I still play from time to time. However, since I don't follow closely video game news, I mostly rely on review websites to decide whether to buy a game or not.
+
+This gave me the idea to start this project in which I used web scraping techniques to collect video game reviews and then applied text analysis tools to try to predict the score given to the game in the review.
+
+## Load and clean data
+
+I first created a dataset of reviews by web scraping all PS4 reviews on [IGN.com](https://www.ign.com/reviews/games/ps4). The code use to collect the data can be found in the `data` folder in this repository. Since there are also  reviews of DLC (downloadable content corresponding to additional content released after the main release of a game), I excluded them from the dataset. Since DLC is mostly additional, but shorter, content compared to the main game, I wanted to avoid skewing the analysis with reviews on "non-complete" games. I also changed the date to year only format (e.g., transforming `12 Mar 2017` to `2017`).
+
+```{r data}
+
+# Load and clean a little bit PS4 reviews
+ps4_reviews <-
+  read_csv(here("data", "ps4_reviews.csv"),
+           col_types = cols(.default = col_character(),
+                            score = col_double())) %>%
+  # Remove review without score
+  drop_na(score) %>%
+  # Remove reviews on DLC
+  filter(!str_detect(url, "-dlc-")) %>%
+  # Change date format
+  mutate(year = as.numeric(str_match(date, "\\d{4}$"))) %>%
+  select(-date)
+```
+
+The dataset contains `r nrow(ps4_reviews)` reviews, with the following variables:
+
++ `game`: the title of the game that the review is about (format: character; the same game can have several reviews from different reviewers)
++ `author`: the name of the reviewer (format: character)
++ `review`: the review (format: character)
++ `score`: the score attributed to the game by the reviewer (format: numeric; range: 0-10)
++ `url`: the url through which the review was retrieved (format: character; serves as unique identifier)
++ `year`: the year the review has been posted (format: numeric)
+
+## Exploring the data
+
+### Reviews' score
+
+Before we try to predict the score of reviews based on their content, let's explore the dataset a little. The distribution of review scores below shows that PS4 games overall received more positive than negative scores, as shown by the vertical peach line indicating the median score of `r median(ps4_reviews$score)`. Also, we clearly see *peaks* for scores corresponding to an integer. This may be due to the fact that some reviewers have a stronger tendency than others to give a score with a decimal (e.g. 7.2). Another possibility could be that the rating scale was not the same for all critics. For example, the scale may have changed from year to year.
+
+```{r eda-1, echo = FALSE}
+
+ps4_reviews %>%
+  ggplot() +
+  aes(x = score, fill = 1) +
+  geom_histogram(alpha = 0.75, color = "white", show.legend = FALSE, bins = 35,
+                 fill = viridis::magma(1, begin = 0.15)) +
+  geom_vline(xintercept = median(ps4_reviews$score),
+             color = viridis::magma(1, begin = 0.75),
+             size = 1) +
+  scale_color_viridis_d(option = "plasma") +
+  coord_cartesian(xlim = c(0, 10)) +
+  scale_x_continuous(breaks = c(0:10)) +
+  labs(x = "Reviews' score",
+       y = "Density") +
+  theme_light()
+
+```
+
+To check if the rating scale has changed over the years, we could analyze the number of unique digits after the decimal point. If only integers are used, only one unique digit should be found (i.e., 0). If only integers and half-integers are used (e.g., 5.0 and 5.5), then only 2 unique values should be observed, and so on. The table below shows the number of unique digits after the decimal point for each year in the dataset. Since the first few years contain only a few reviews, the data may not be representative However, we can see a change between 2019 and 2020. Before 2020, 9 to 10 unique digits were used after the decimal point, while in 2020 and beyond, only 1 or 2 digits are used.
+
+```{r eda-2, echo = FALSE}
+
+ps4_reviews %>%
+  mutate(year_last_digit = if_else(nchar(as.character(score, 1)) > 1, str_match(score, "\\d$"), "0")) %>%
+  group_by(Year = year) %>%
+  summarise(`Unique digits after comma` = length(unique(year_last_digit))) %>%
+  gt()
+
+```
+
+As said before, there could be multiple reasons: different raters may have chosen to use different rating scales (with or without decimals) or the site's rating scale may have changed. Whatever the reason is, I think it would be a good idea to round all the scores to have a common scale with only integer values. After transformation, we can see in the figure below that the distribution of scores looks better than before, but it is still left-skewed.
+
+```{r eda-3, echo = FALSE}
+
+ps4_reviews %>%
+  mutate(score = round(score)) %>%
+  group_by(score) %>%
+  summarise(n = n()) %>%
+  ggplot() +
+  aes(x = score, y = n, fill = 1) +
+  geom_col(alpha = 0.7, show.legend = FALSE, fill = viridis::magma(1, begin = 0.15)) +
+  coord_cartesian(xlim = c(0, 10)) +
+  scale_x_continuous(breaks = c(0:10)) +
+  labs(x = "Reviews' score",
+       y = "Count") +
+  theme_light()
+
+```
+
+### Number of reviews' per year
+
+Looking at the distribution of reviews over the year, we see that the number of reviews started to increase around 2013/2014, which coincides with the release of the console. This also suggests that the few reviews we have that date back to before the release of the PS4 could be incorrectly attributed to PS4 games and they will be ignored in the current analysis. Overall, we see a stable number of about `r ps4_reviews %>% filter(year > 2012, year < 2022) %>% group_by(year) %>% summarise(n = n()) %>% summarise(mean = round(mean(n)/10, 0)*10) %>% pull(mean)` reviews per year (except for 2013 and 2022).
+
+```{r eda-4, echo = FALSE}
+
+ps4_reviews %>%
+  group_by(year) %>%
+  summarise(n = n()) %>%
+  ggplot() +
+  aes(x = year, y = n, fill = 1) +
+  geom_col(alpha = 0.7, show.legend = FALSE, fill = viridis::magma(1, begin = 0.15)) +
+  coord_cartesian(xlim = c(2006, 2022)) +
+  scale_x_continuous(breaks = seq(2006, 2022, 2)) +
+  labs(x = "Reviews' score",
+       y = "Count") +
+  theme_light()
+
+```
+
+### Length of the reviews
+
+As my goal is to perform a content analysis of the reviews to try to predict the score obtained, the reviews will be transformed into a `tidytext' format (see [https://www.tidytextmining.com/tidytext.html](https://www.tidytextmining.com/tidytext.html)). This is a convenient format where each line contains a single token, and where a token can be, for example, a word, a bigram or a sentence The transformation is performed in the code chunk below, and the dataset is also cleaned of reviews prior to 2013.
+
+```{r eda-5}
+
+ps4_reviews_tidytext <-
+  ps4_reviews %>%
+  filter(year > 2012) %>%
+  # Score are rounded to closest integer and "’" is replaced with "'" to have
+  # a unique apostrophe in words like "don't"
+  mutate(score = round(score),
+         review = str_replace_all(review, "’", "'")) %>%
+  unnest_tokens(word, review)
+
+ps4_reviews_length_summary <-
+  ps4_reviews_tidytext %>%
+  group_by(game, url, year) %>%
+  summarise(n_words = n(),
+            score = unique(score))
+
+```
+
+The histogram below shows that most of the reviews have a number of words between 500 and 2000 words, with a median number of `r median(ps4_reviews_length_summary$n_words)` (indicated by the vertical peach line).
+
+```{r eda-6, echo = FALSE}
+
+ps4_reviews_length_summary %>%
+  ggplot() +
+  aes(x = n_words, fill = 1) +
+  geom_histogram(alpha = 0.75, show.legend = FALSE, color = "white",
+                 fill = viridis::magma(1, begin = 0.15)) +
+  geom_vline(xintercept = median(ps4_reviews_length_summary$n_words),
+             color = viridis::magma(1, begin = 0.75),
+             size = 1) +
+  scale_color_viridis_d(option = "plasma") +
+  labs(x = "Number of words",
+       y = "Count") +
+  theme_light()
+
+```
+
+Given the variability in reviews' length, it may be interesting to examine the relationship between the number of words and the score granted in the review. The figure below shows that while there is a positive relationship between word count and score, it is not very strong, as evidenced by the low correlation between the two variables (r = `r round(cor(ps4_reviews_length_summary$score, ps4_reviews_length_summary$n_words), 2)`).
+
+```{r eda-7, echo = FALSE}
+
+ps4_reviews_length_summary %>%
+  ggplot() +
+  aes(x = score, y = n_words) +
+  geom_jitter(width = 0.15, show.legend = FALSE,
+              color = viridis::magma(1, begin = 0.4)) +
+  geom_smooth(method = "lm", se = FALSE, show.legend = FALSE,
+              color = viridis::magma(1, begin = 0.75)) +
+  scale_x_continuous(breaks = c(2:10)) +
+  labs(x = "Review's score",
+       y = "Number of words") +
+  theme_light()
+
+```
+
+Finally, it might be interesting to see if the length of the reviews has changed over time. We see in the figure below that the length remained stable from 2013 to 2015, before increasing between 2015 to 2017 and then stabilizing since then. We also see that the year 2022 stands out from all other years, but this could be misleading because this year is not yet complete. Overall, the reviews from 2017 to 2021 are `r median(ps4_reviews_length_summary$n_words[ps4_reviews_length_summary$year >= 2017]) - median(ps4_reviews_length_summary$n_words[ps4_reviews_length_summary$year > 2012 & ps4_reviews_length_summary$year < 2017])` words longer (median difference) than those from 2012 to 2016, which corresponds to an increase of about `r round(((median(ps4_reviews_length_summary$n_words[ps4_reviews_length_summary$year >= 2017])/median(ps4_reviews_length_summary$n_words[ps4_reviews_length_summary$year > 2012 & ps4_reviews_length_summary$year < 2017])) - 1) * 100, 0)`%.
+
+```{r eda-8, echo = FALSE}
+
+ps4_reviews_length_summary %>%
+  filter(year > 2012) %>%
+  ggplot() +
+  aes(x = year, y = n_words, group = year) +
+  geom_boxplot(alpha = 0.75,
+               color = viridis::magma(1, begin = 0.75),
+               fill = viridis::magma(1, begin = 0.15),
+               outlier.shape = NA) +
+  coord_cartesian(ylim = c(0, 4000)) +
+  scale_x_continuous(breaks = seq(2013, 2022, 1)) +
+  labs(x = "Year",
+       y = "Number of words") +
+  theme_light()
+
+```
+
+### Sentiment analysis
+
+We have observed so far that the reviews scored fairly good overall, that the length of the reviews increased slightly over time, and that there is a positive, but weak correlation between the reviews' length and the score awarded. Now, it's time to go a step further and analyze the content of the reviews to see if the *sentiment* expressed differs based on the score given.
+
+For this step, the reviews are again transformed into a tidytext format but the tokens are now bigrams. This will allow to assign a *sentiment* to the words in a more precise way. Indeed, when each word is analyzed without context, a word like *great* will be considered as positive even if the word is preceded by a negation (for example, *not great*). By using bigrams instead of a single word as a token, we can easily determine for each word whether it was preceded by a negative word or not in the review and thus modify the *sentiment* assigned to a word based on the previous word when necessary.
+
+Before looking at sentiments in more details, it is important to clean the reviews from the presence of any *stop words* (i.e., common words that are not very informative, such as *the* or *of*). In addition, for each review, any word that is in the review's title will also be considered as a *stop word*. This is done to avoid biasing the analysis with certain words that may be used frequently to name the game and may bias the analysis. For example, if you have a game with the word *lost* in it's title, one could observe a higher frequency for that word just because it is used to name the game, not to give a specific meaning. This is evident that this could in return influence any *sentiment* analysis.
+
+In the chunk below, the following operations are applied:
+
+1. The reviews are transformed into bigrams
+2. The second word of each bigram is assigned a *sentiment* score (from -5 to 5) using the *AFINN* lexicon (sentiment is defined as `NA` when a word cannot be found in the lexicon).
+3. The second word of each bigram is assigned to a *sentiment* (positive or negative) using the *Bing* lexicon (sentiment is defined as `NA` when a word cannot be found in the lexicon).
+4. The sentiment of the second word of each bigram is changed (AFINN score is multiplied by -1 and the Bing class is reversed) if the first bigram word is a *negation* word (see the list in the chunk below).
+5. *Stop words* (including title words) are removed.
+6. Tokens are replaced by single words
+
+```{r sentiment-clean}
+
+# Transform reviews to tidytext format with bigrams as tokens and scores are round
+# to the nearest integer, Only reviews from 2013 and after are considered.
+ps4_reviews_bigram <-
+  ps4_reviews %>%
+  filter(year > 2012) %>%
+  mutate(score = round(score),
+         review = str_replace_all(review, "’", "'")) %>%
+  unnest_ngrams(two_gram, review, n = 2) %>%
+  separate(two_gram, into = c("word_1", "word_2"), sep = " ")
+
+# Tokenizes the title of each set, then removes the stop words and numbers.
+# An extra column containing the word with ['s] added at the end is created.
+# For example, this allows to detect cases like [moss's book] in the game
+# 'Moss: Book 2'.
+ps4_reviews_tidy_titles <-
+  ps4_reviews %>%
+  filter(year > 2012) %>%
+  mutate(title = game) %>%
+  select(game, title) %>%
+  unnest_tokens(word, title) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!str_detect(word, "\\d")) %>%
+  mutate(word2 = glue::glue("{word}'s"))
+
+# List of 'negation' words
+negative_words <- c("no", "not", "none", "nobody", "nothing", "neither",
+                    "nowhere", "never", "hardly", "scarcely", "barely",
+                    "doesn't", "isn't", "wasn't", "shouldn't", "wouldn't",
+                    "couldn't", "won't", "can't", "don't", "without")
+
+ps4_reviews_bigram_sentiments <-
+  ps4_reviews_bigram %>%
+  # Assign a sentiment score (-5 to 5) to each bigram's second word using the AFINN lexicon
+  left_join(select(get_sentiments("afinn"), word, afinn_value = value), by = c("word_2" = "word")) %>%
+  # Assign a sentiment (positive or negative) to each bigram's second word using the BING lexicon
+  left_join(select(get_sentiments("bing"), word, bing_sentiment = sentiment), by = c("word_2" = "word")) %>%
+  # Determine if the first word in a bigram is a 'negation word'.
+  # Next, reverse the sentiment of the second word if the first word is a 'negation'
+  mutate(is_preceding_negative = word_1 %in% negative_words,
+         bing_sentiment = case_when(is_preceding_negative & bing_sentiment == "negative" ~ "positive",
+                                    is_preceding_negative & bing_sentiment == "positive" ~ "negative",
+                                    !is_preceding_negative ~ bing_sentiment),
+         afinn_value = if_else(is_preceding_negative, afinn_value*-1, afinn_value)) %>%
+  # Remove stop words (including title words)
+  filter(!(word_2 %in% get_stopwords(language = "en", source = "snowball")$word)) %>%
+  anti_join(ps4_reviews_tidy_titles, by = c("game", "word_2" = "word")) %>%
+  anti_join(ps4_reviews_tidy_titles, by = c("game", "word_2" = "word2")) %>%
+  # Switch from bigram to word as token
+  select(-word_1) %>%
+  rename(word = word_2)
+
+```
+
+Now that we have information about the sentiment expressed in the reviews, let's look at the proportion of words labeled negative and positive according to the `Bing` lexicon. Although not surprising, we observe that the proportion of negative words is twice as high as the proportion of positive words in the reviews with the worst score, which is 2. The difference gradually decreases until it reaches an equal proportion of negative and positive words when the score is 6. Above 6, the proportion of positive words is higher and the difference increases as the score approaches the maximum of 10.
+
+```{r sentiment-1, echo = FALSE}
+
+ps4_reviews_bigram_sentiments %>%
+  group_by(score, game, sentiment = bing_sentiment) %>%
+  mutate(sentiment = replace_na(sentiment, "unknown")) %>%
+  count() %>%
+  group_by(score, game) %>%
+  mutate(prop = n / sum(n)) %>%
+  group_by(score, sentiment) %>%
+  summarise(n = mean(n),
+            prop = mean(prop)) %>%
+  filter(sentiment != "unknown") %>%
+  ggplot() +
+  aes(x = score, y = prop, fill = sentiment) +
+  geom_col(position = "dodge", color = "white") +
+  coord_cartesian(xlim = c(1.8, 10.2)) +
+  scale_x_continuous(breaks = c(2:10)) +
+  viridis::scale_fill_viridis(option = "magma", alpha = 0.75, begin = 0.15, end = 0.75,
+                              discrete = TRUE) +
+  labs(title = "Sentiment analysis (Bing et al. lexicon)",
+       x = "Review's score",
+       y = "Proportion",
+       fill = "Sentiment") +
+  theme_light()
+
+```
+
+Now let's consider the *AFINN* lexicon to see if we get a similar picture in terms of *sentiment* expressed as a function of score. We find that as score awarded increases, the sentiment level also increases (i.e., meaning more positive), which is consistent with the analysis done with the *Bing* lexicon.
+
+```{r sentiment-2, echo = FALSE}
+
+ps4_reviews_bigram_sentiments %>%
+  group_by(game, url) %>%
+  drop_na(afinn_value) %>%
+  summarise(sentiment = mean(afinn_value, na.rm = TRUE),
+            score = unique(score)) %>%
+  ggplot() +
+  aes(x = score, y = sentiment) +
+  geom_jitter(width = 0.15, color = viridis::magma(1, begin = 0.4)) +
+  stat_summary(aes(x = score + 0.2), fun = "mean", geom = "line",
+               color = viridis::magma(1, begin = 0.75), size = 1) +
+  coord_cartesian(xlim = c(2, 10)) +
+  scale_x_continuous(breaks = c(2:10)) +
+  labs(title = "Sentiment analysis (AFINN lexicon)",
+       x = "Review's score",
+       y = "Sentiment") +
+  theme_light()
+
+```
+
+## Building the model
+
+To summarize, the exploratory data analysis informed us of the following:
+
++ reviews have a median length of `median(ps4_reviews$score)` words.
++ review length has increased slightly over time (especially around 2016)
++ score and review length are correlated (but the correlation is weak).
++ The higher the review score, the more positive feelings are expressed.
+
+I will now build a model to predict the score of the reviews using the tf-idf index of the words, the length of the review (i.e., the number of words), and an indicator of whether each word is preceded by a negative word.
+
+The tf-idf measures the frequency of a word in a review (*term frequency* or tf), multiplied by the inverse of the frequency of the word in all reviews (*inverse document frequency* or idf). In other words, the tf of words that are widely used across reviews will decrease, while it will increase for words that are rarely used (for more information on tf-idf, see [here](https://www.tidytextmining.com/tfidf.html#tfidf)).
+
+For the marker indicating whether a word is preceded by a negative term in a review, I will simply add the prefix `NEG_` to the word before calculating the tf-idf of all words. This will allow to differentiate the occurrence of the same word but in different contexts. All these steps are performed in the code chunk below.
+
+```{r final-data}
+
+final_data <-
+  # Use the already clean dataset with bigrams as token and sentiment indicator
+  ps4_reviews_bigram_sentiments %>%
+  # Append a prefix to any word preceded by a negative word
+  mutate(word = if_else(is_preceding_negative, glue::glue("NEG_{word}"), word)) %>%
+  select(-c(bing_sentiment, afinn_value, author)) %>%
+  # Next steps undo the tokenization because this will be perform in the modeling workflow
+  group_by(url) %>%
+  mutate(length = n(),
+         review = glue::glue_collapse(word, sep = " ")) %>%
+  ungroup() %>%
+  select(-c(word, is_preceding_negative)) %>%
+  distinct()
+
+```
+
+Now that we have the final dataset, we will divide it into training and test sets. Since the number of reviews is not really high (n = `r nrow(final_data)`), 60% of the data will be assigned to the training set. For the same reason, the training set will not be split to create a validation set. Instead, a bootstrap validation will be used (i.e., out-of-bag or OOB method).
+
+
+```{r data-split}
+
+library(tidymodels)
+
+set.seed(35246)
+
+ps4_review_split <- initial_split(final_data, prop = .6, strata = score)
+ps4_review_train <- training(ps4_review_split)
+ps4_review_test <- testing(ps4_review_split)
+
+```
+
+As the training set is now ready, the next step is to prepare a recipe where we define all the pre-processing steps needed before building the model. The outcome we are trying to predict is the `score` given to the games and the predictors will be the tf-idf of the `words` contained in the review and the `length` of the review.
+
+```{r recipe}
+
+library(textrecipes)
+library(embed)
+
+ps4_review_recipe <-
+  # Define 'score' as outcome and 'review' content and 'length' as predictors
+  recipe(score ~ review + length, data = ps4_review_train) %>%
+  # Tokensize the content of the review (token = word). Note that there is no
+  # step removing stop words and words contained in the game title. This was
+  # done earlier, when creating the final dataset (it is not done in the recipe
+  # because, to my knowledge, it cannot be implemented in a recipe step).
+  step_tokenize(review) %>%
+  # Compute the tf-idf of each token
+  step_tfidf(review) %>%
+  # Normalize tf-idf values and length
+  step_normalize(all_predictors())
+
+```
+
+In this analysis, I will use a lasso linear regression, allowing for the selection of the most relevant predictors, as well as the regularization of predictors by adding a penalty to their coefficients. Since we don't know what is the most optimal level of penalty we should apply, this will be tuned in the next steps.
+
+```{r model-wfl-spec}
+
+# Lasso linear regression => mixture = 1
+# penalty is set as 'tune()' as the best value is currently unknown
+ps4_review_spec <-
+  linear_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet")
+
+# The worflow consisting of a recipe to which a model is added
+ps4_review_wf <-
+  workflow() %>%
+  add_recipe(ps4_review_recipe) %>%
+  add_model(ps4_review_spec)
+
+# The penalty values we will use to find the most optimal one
+penalty_grid <- grid_regular(penalty(), levels = 40)
+
+```
+
+In the next step, we define 50 bootstrapped versions of the training set that will be used for validation when tuning the penalty level. After that, for each penalty level, we fit the model to the training set and then examine the predicted reviews score using the validation set while collecting accuracy metrics. Here, I will use the *mean absolute error* or MAE (i.e., the mean absolute difference between the predicted and actual scores).
+
+```{r train, cache = TRUE}
+
+set.seed(1972)
+
+# Creates 50 datasets using bootstraps as validation set
+ps4_review_folds <-
+  bootstraps(
+    ps4_review_train,
+    times = 50,
+    strata = score
+  )
+
+
+doParallel::registerDoParallel()
+
+set.seed(2020)
+
+# Fit the model to the training set for each level of penalty and predict scores
+# from the validation set.
+ps4_lm_grid <-
+  tune_grid(
+    ps4_review_wf,
+    resamples = ps4_review_folds,
+    grid = penalty_grid,
+    control = control_grid(save_pred = TRUE),
+    metrics = metric_set(mae)
+  )
+
+```
+
+It is now time to look at the accuracy of the model for each penalty level. As said, I use MAE but it is important to adapt the procedure a little because the predicted scores are not on the same scale as the actual scores Indeed, the actual, but not predicted scores, are rounded. In this case, it may be appropriate to compute the MAE again after rounding the predictions to the nearest integer. We will also retrieve the absolute difference between the predicted and actual scores from the best model to examine the distribution.
+
+```{r train-mae-rounded}
+
+mae_pred_round_metric <-
+  ps4_lm_grid %>%
+  # Collect predicted values for each bootstrap and penalty level
+  collect_predictions() %>%
+  group_by(id, penalty, .config) %>%
+  # Compute the classical MAE and MAE after rounding the predictions ('mae_pred_round')
+  summarise(mae_pred_round = mae_vec(truth = score, estimate = round(.pred)),
+            mae = mae_vec(truth = score, estimate = .pred)) %>%
+  # Average the MAE and custom MAE across bootstraps for each penalty level
+  group_by(penalty, .config) %>%
+  summarise(mae_pred_round = mean(mae_pred_round),
+            mae = mean(mae))
+
+# Parameters of the model with the lowest custom MAE
+best_mae_pred_rond <-
+  mae_pred_round_metric %>%
+  filter(mae_pred_round == min(.$mae_pred_round))
+
+# Collect the absolute deviation between predicted and actual scores when applying
+# the best model (will be used to plot the distribution of deviations)
+training_pred_dev <-
+  ps4_lm_grid %>%
+  collect_predictions(
+    parameters = select(best_mae_pred_rond, penalty, .config)
+  ) %>%
+  summarise(dev = abs(round(.pred)-score))
+
+```
+
+As we can see in the figure below, the MAE reaches its lowest level (`r round(best_mae_pred_rond$mae_pred_round, 4)`) when the penalty is set to `r round(best_mae_pred_rond$penalty, 4)`, this with both the classical computation and the computation applied after rounding the predictions. Overall, when the penalty applied is `r round(best_mae_pred_rond$penalty, 4)`, the predictions are on average a little less than one point from the original score. Rounding the predicted values to the nearest integer also improves the MAE for all levels of penalty.
+
+```{r, echo = FALSE}
+
+mae_pred_round_metric %>%
+  rename(`mae (custom)` = mae_pred_round) %>%
+  pivot_longer(cols = -c(penalty, .config), names_to = "metric") %>%
+  ggplot() +
+  aes(x = penalty, y = value, color = metric, group = metric) +
+  geom_vline(xintercept = best_mae_pred_rond$penalty) +
+  geom_line(size = 1) +
+  viridis::scale_color_viridis(option = "magma", begin = 0.15, end = 0.75,
+                              discrete = TRUE) +
+  labs(x = "Penalty",
+       y = "Mean absolute error") +
+  theme_light()
+
+```
+
+When we look in more detail at the distribution of the absolute deviation of the predicted scores, we see in the histogram below that `r round(mean(training_pred_dev$dev < 2) *100, 0)`% of the predicted values deviate by no more than 1 point from the actual score. In other words, `r round(mean(training_pred_dev$dev < 2) *100, 0)`% of the predicted values are no more than 1 point away from the original score.
+
+```{r train-dev}
+
+training_pred_dev %>%
+  count(dev) %>%
+  mutate(n = n/sum(n)) %>%
+  ggplot() +
+  aes(x = dev, y = n) +
+  geom_col(alpha = 0.75, show.legend = FALSE, fill = viridis::magma(1, begin = 0.15)) +
+  scale_x_continuous(breaks = c(0:7)) +
+  labs(x = "Absolute deviation",
+       y = "Proportion") +
+  theme_light()
+
+```
+
+Now that we have a model that did a pretty decent job during the training phase, let's see if its performance generalizes to the test set. In the following code chunk, the best model is fitted one last time to the training set (i.e., with a penalty of `r round(best_mae_pred_rond$penalty, 4)`) and then the parameters of the fitted model are used to predict the scores from the test set. Next, we will compute the custom MAE and collect the absolute difference between the rounded predicted scores and the actual scores to look at the distribution.
+
+```{r test}
+
+# Update the initial to fit only a model with the optimal penalty level
+final_wf <-
+  finalize_workflow(
+    ps4_review_wf,
+    parameters = select(best_mae_pred_rond, penalty, .config)
+  )
+
+# Fit the best model to training data
+ps4_last_fit <- last_fit(final_wf, ps4_review_split)
+
+# Compute MAE and custom MAE
+mae_pred_round_metric_test <-
+  ps4_last_fit %>%
+  collect_predictions() %>%
+  summarise(mae_pred_round = mae_vec(truth = score, estimate = round(.pred)),
+            mae = mae_vec(truth = score, estimate = .pred))
+
+# Collect the absolute difference between rounded predicted scores and actual scores
+test_pred_dev <-
+  ps4_last_fit %>%
+  collect_predictions() %>%
+  summarise(dev = abs(round(.pred)-score))
+
+```
+
+Good news, it looks like there was no overfit during the training phase! Indeed, the accuracy of the model in predicting test set scores was as good as in predicting scores during the training phase, with a custom MAE of `r round(best_mae_pred_rond$mae_pred_round, 4)` and `r round(mae_pred_round_metric_test$mae_pred_round, 4)` when predicting training and test scores, respectively. The figure below also shows that `r round(mean(test_pred_dev$dev < 2)*100, 0)`% of the scores predicted from the test set are at most 1 point away from the original score, as during training. This then confirms the good performance of the model!
+
+
+```{r test-eval, echo = FALSE}
+
+test_pred_dev %>%
+  count(dev) %>%
+  mutate(n = n/sum(n)) %>%
+  ggplot() +
+  aes(x = dev, y = n) +
+  geom_col(alpha = 0.75, show.legend = FALSE, fill = viridis::magma(1, begin = 0.15)) +
+  labs(x = "Absolute deviation",
+       y = "Proportion") +
+  theme_light()
+
+```
+
+Now let's see which words/variables are the most important in predicting review scores. The figure below shows for negative and positive predictors the 15 that contribute most to predicting actual scores.
+
+It is interesting to note that the two most important predictors are the words *repetitive* and *worse*. Since these are negative predictors, this means that the more frequent these words are in a review, the more likely it is that the review will attribute a bad score to the game.
+
+The variable 'length' appears to be the third most important predictor. The fact that it is a positive predictor suggests that the longer a review is, the more likely it is that the game being reviewed will get a good score (confirming the positive but weak correlation between score and length observed during the EDA).
+
+We also see reviews with a higher frequency of words such as *love*, *unexpected*, *dedicated*, *rewarding*, *brilliantly*, or *smartly* are more likely to grant a high score. In contrast, reviews with a higher frequency of words like *unfortunately*, *problem*, *fails*, *lack*, *bug*, or *ignores* are more likely to give low scores.
+
+```{r test-importance, echo = FALSE}
+
+library(vip)
+
+ps4_last_fit %>%
+  extract_fit_parsnip() %>%
+  vi_model() %>%
+  filter(Importance != 0) %>%
+  mutate(Variable = str_remove(Variable, "tfidf_review_"),
+         Variable = str_replace_all(Variable, "neg_", "[negative] ")) %>%
+  arrange(desc(abs(Importance))) %>%
+  group_by(Sign) %>%
+  slice(1:15) %>%
+  ungroup() %>%
+  mutate(Importance = if_else(Sign == "NEG", -Importance, Importance),
+         Variable = fct_reorder(Variable, Importance)) %>%
+  ggplot() +
+  aes(x = Importance, y = Variable, fill = Sign) +
+  geom_col(show.legend = FALSE) +
+  coord_cartesian(xlim = c(-.16, .16)) +
+  scale_x_continuous(breaks = round(seq(-.15, .15, 0.05), 2)) +
+  labs(y = NULL) +
+  viridis::scale_fill_viridis(option = "magma", alpha = 0.75, begin = 0.15, end = 0.85,
+                              discrete = TRUE) +
+  theme_light()
+
+```
+
+## Conclusion
+
+<b>To conclude, the model revealed that we can use:
+
++ the length (characterized by the number of words used);
++ the presence/absence of important words indicating some form of surprise or joy (e.g., *love*, *brilliantly*, or *smartly*);
++ the presence/absence of important words with a connotation of sadness or disappointment (e.g., *repetitive*, *fails*, or *ignores*);
++ the presence/absence of important words emphasizing technical problem (e.g., *problem* or *bug*);
+
+of reviews collected on IGN.com to predict the score awarded to PS4 games.</b>
+
+However, the positive contribution of words like *wings* or *runners* is unclear. If we look at the occurrence of these tokens, *wings* appears only once in 6 reviews and twice in another. The pattern is very similar for *runners*. It seems that these two predictors are some kind of artifact because they only predict the score for a small subset of reviews. It would not be surprising if these terms did not emerge as important predictors when using a new data set, contrary to more general terms like *love* or *fails*.
+
+Although the model built in this project was able to accurately predict the scores given in the reviews, this is not the only thing we could do with the dataset retrieved from ING.com. It might be interesting to apply topic modeling techniques to see if we can build a model to automate the categorization of the types of games the reviews are about (e.g., sports, adventure, racing, arcade). Another interesting thing to do would be to collect reviews on different games, and on a different console, to see if the model developed here can be generalized to a completely new dataset.
